@@ -1,0 +1,213 @@
+Got it 👍 Let me draft a clean documentation for you so you can keep it in your project notes.
+
+---
+
+# 📘 V2X Multicast Node Setup (Jetson Nano + Raspberry Pi)
+
+This document explains how to set up **bi-directional V2X multicast communication** between a Jetson Nano and a Raspberry Pi. Both devices send and receive simulated BSM (Basic Safety Messages) over UDP multicast. The service is configured to start automatically on boot using `systemd`.
+
+---
+
+## 1. Requirements
+
+* Jetson Nano (Ubuntu 20.04+)
+* Raspberry Pi (Raspberry Pi OS Bookworm)
+* Same Wi-Fi network (multicast allowed on AP)
+* Python 3 installed
+* `paho-mqtt` package installed (future extension to OVERTON ingestion)
+
+```bash
+sudo apt update
+sudo apt install python3-paho-mqtt -y
+```
+
+---
+
+## 2. V2X Multicast Node Script
+
+Create `v2x_multicast_node.py` in the home directory of each device:
+
+```bash
+nano ~/v2x_multicast_node.py
+```
+
+Paste the script (handles sending + receiving):
+
+```python
+#!/usr/bin/env python3
+import socket, struct, time, json, random, threading, argparse
+
+MCAST_GRP = "239.255.0.1"
+MCAST_PORT = 5007
+TTL = 2
+
+def sender(node_id, rate):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, TTL)
+
+    seq = 0
+    lat, lon = 38.8951, -77.0364  # start near DC
+    while True:
+        msg = {
+            "id": node_id,
+            "seq": seq,
+            "ts": time.time(),
+            "lat": lat,
+            "lon": lon,
+            "speed": random.uniform(5, 15)
+        }
+        sock.sendto(json.dumps(msg).encode("utf-8"), (MCAST_GRP, MCAST_PORT))
+        seq += 1
+        lat += 0.0001
+        lon += 0.0001
+        time.sleep(1.0 / rate)
+
+def receiver(node_id):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", MCAST_PORT))
+
+    mreq = struct.pack("=4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+    while True:
+        data, addr = sock.recvfrom(4096)
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            if msg.get("id") == node_id:  # ignore self
+                continue
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "RX from", addr, ":", msg)
+        except Exception as e:
+            print("Error decoding message:", e)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--id", required=True)
+    parser.add_argument("--rate", type=int, default=5)
+    args = parser.parse_args()
+
+    threading.Thread(target=receiver, args=(args.id,), daemon=True).start()
+    sender(args.id, args.rate)
+```
+
+Make it executable:
+
+```bash
+chmod +x ~/v2x_multicast_node.py
+```
+
+---
+
+## 3. Systemd Service
+
+Create a systemd service so the node starts on boot.
+
+```bash
+sudo nano /etc/systemd/system/v2x-node.service
+```
+
+### Jetson Nano (`/home/ubuntu/...`):
+
+```ini
+[Unit]
+Description=V2X Multicast Node (Jetson Nano)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/v2x_multicast_node.py --id jetson_nano --rate 5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Raspberry Pi (`/home/pi/...`):
+
+```ini
+[Unit]
+Description=V2X Multicast Node (Raspberry Pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+ExecStart=/usr/bin/python3 /home/pi/v2x_multicast_node.py --id raspi_01 --rate 5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 4. Enable & Start Service
+
+Run on both devices:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now v2x-node.service
+```
+
+Check status:
+
+```bash
+systemctl status v2x-node
+```
+
+Follow logs live:
+
+```bash
+sudo journalctl -u v2x-node -f
+```
+
+---
+
+## 5. Verification
+
+After boot, check:
+
+```bash
+systemctl is-enabled v2x-node   # should say "enabled"
+systemctl is-active v2x-node    # should say "active"
+```
+
+Look at logs from current boot:
+
+```bash
+journalctl -u v2x-node -b
+```
+
+You should see lines like:
+
+```
+2025-09-20 18:47:22 RX from ('192.168.0.142', 37185): {'id': 'jetson_nano', 'seq': 2445, 'ts': ..., 'lat': ..., 'lon': ..., 'speed': ...}
+```
+
+---
+
+## 6. Troubleshooting
+
+* Ensure both devices are on the **same Wi-Fi subnet**.
+* Some enterprise routers block multicast. Test with:
+
+  ```bash
+  tcpdump -i wlan0 udp port 5007
+  ```
+* If you want to see your own messages too, **remove this line** in the script:
+
+  ```python
+  if msg.get("id") == node_id: continue
+  ```
+
+---
+
+✅ At this point, Jetson Nano and Raspberry Pi exchange V2X-like BSMs automatically after each reboot.
+
+---
+
+Would you like me to extend this doc with a **section on how to plug this feed into OVERTON’s data ingestion (ROS topic or MQTT broker)** so it becomes a live test input?
