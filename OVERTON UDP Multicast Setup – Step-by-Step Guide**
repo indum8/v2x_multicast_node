@@ -1,0 +1,222 @@
+Absolutely! Let’s put everything together into a **complete, step-by-step guide** for setting up OVERTON with Raspberry Pi (as sender) and Jetson Nano (as receiver) using UDP multicast. I’ll structure it clearly, including testing and troubleshooting.
+
+---
+
+# **OVERTON UDP Multicast Setup – Step-by-Step Guide**
+
+---
+
+## **1️⃣ Prepare Raspberry Pi (Sender Node)**
+
+### a) Install Python dependencies
+
+```bash
+sudo apt update
+sudo apt install python3-pip -y
+pip3 install numpy pandas tsfresh xgboost shap matplotlib
+```
+
+### b) Create the multicast Python script
+
+File: `/home/pi/v2x_multicast_node.py`
+
+```python
+#!/usr/bin/env python3
+import socket, struct, json, time, argparse, threading, uuid
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--id", default=None, help="node id (default: random)")
+parser.add_argument("--group", default="239.255.0.1", help="multicast group")
+parser.add_argument("--port", type=int, default=5007, help="UDP port")
+parser.add_argument("--rate", type=float, default=5.0, help="messages per second")
+args = parser.parse_args()
+
+NODE_ID = args.id if args.id else f"node-{uuid.uuid4().hex[:6]}"
+MCAST_GRP = args.group
+PORT = args.port
+RATE = args.rate
+INTERVAL = 1.0 / RATE
+
+# Receive socket
+recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+recv_sock.bind(('', PORT))
+mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+# Send socket
+send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+print(f"[{NODE_ID}] multicast node starting, group={MCAST_GRP}:{PORT}, rate={RATE} msg/s")
+
+def recv_loop():
+    while True:
+        data, addr = recv_sock.recvfrom(8192)
+        try:
+            msg = json.loads(data.decode('utf-8'))
+        except Exception:
+            continue
+        if msg.get("id") == NODE_ID:
+            continue
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), f"RX from {addr}: ", msg)
+
+def send_loop():
+    seq = 0
+    while True:
+        bsm = {
+            "id": NODE_ID,
+            "seq": seq,
+            "ts": time.time(),
+            "lat": 38.895 + 0.0001 * (seq % 10),
+            "lon": -77.036 + 0.0001 * (seq % 7),
+            "speed": 5.0 + (seq % 5)
+        }
+        send_sock.sendto(json.dumps(bsm).encode('utf-8'), (MCAST_GRP, PORT))
+        seq += 1
+        time.sleep(INTERVAL)
+
+threading.Thread(target=recv_loop, daemon=True).start()
+threading.Thread(target=send_loop, daemon=True).start()
+
+while True:
+    time.sleep(60)
+```
+
+---
+
+### c) Create systemd service to autostart
+
+File: `/etc/systemd/system/v2x-node.service`
+
+```ini
+[Unit]
+Description=V2X Multicast Node (Raspberry Pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+ExecStart=/usr/bin/python3 /home/pi/v2x_multicast_node.py --id raspi_01 --group 239.255.0.1 --port 5007 --rate 5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable v2x-node.service
+sudo systemctl start v2x-node.service
+sudo journalctl -u v2x-node -f
+```
+
+✅ At this point, Raspberry Pi is sending BSMs via multicast and logging received messages.
+
+---
+
+## **2️⃣ Prepare Jetson Nano (Receiver Node / OVERTON)**
+
+### a) Clone OVERTON
+
+```bash
+git clone https://github.com/OvertonV2X/OVERTON.git
+cd OVERTON
+pip3 install -r requirements.txt
+```
+
+### b) Edit `OVERTON.py` to **disable feature extraction** (if using pre-trained model)
+
+```python
+EXTRACT_FEATURES = False
+```
+
+---
+
+### c) Create UDP listener script on Jetson Nano
+
+File: `/home/jetson/udp_listener_test.py`
+
+```python
+import socket, struct, json
+
+MCAST_GRP = '239.255.0.1'
+PORT = 5007
+NODE_ID = 'jetson_nano'
+
+recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+recv_sock.bind(('', PORT))
+mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+print(f"[{NODE_ID}] Listening on {MCAST_GRP}:{PORT}")
+while True:
+    data, addr = recv_sock.recvfrom(8192)
+    msg = json.loads(data.decode())
+    if msg.get("id") != NODE_ID:
+        print(f"RX from {addr}: {msg}")
+```
+
+Run:
+
+```bash
+python3 udp_listener_test.py
+```
+
+* You should see messages from `raspi_01` and Jetson itself if there are multiple listeners.
+
+---
+
+## **3️⃣ Verify UDP Multicast**
+
+On both Pi and Jetson Nano:
+
+```bash
+# List all processes listening to UDP port 5007
+sudo netstat -anu | grep 5007
+```
+
+Check logs on Pi:
+
+```bash
+sudo journalctl -u v2x-node -f
+```
+
+Check logs on Jetson:
+
+```bash
+python3 udp_listener_test.py
+```
+
+✅ Both nodes should **see each other’s messages**.
+
+---
+
+## **4️⃣ Run OVERTON Detection**
+
+```bash
+cd ~/OVERTON
+python3 OVERTON.py
+```
+
+* With `EXTRACT_FEATURES = False`, OVERTON will skip CSV extraction and use pre-trained models.
+* Incoming BSMs from Pi can be ingested via **future integration hooks** (currently printed in `udp_listener_test.py`).
+
+---
+
+## **5️⃣ Notes / Tips**
+
+* **Multicast behavior**: All devices on the same multicast group receive messages from others. Filter by `msg['id']` to ignore your own messages.
+* **Ports & groups** must match exactly on Pi and Jetson.
+* **Firewall**: Ensure UDP port `5007` is allowed on both devices.
+* **Testing**: Start Pi first, then Jetson, to see live messages.
+
+---
+
+If you want, I can create a **ready-to-run script** that **feeds live Pi messages directly into OVERTON detection** without saving CSVs — this makes real-time testing seamless.
+
+Do you want me to do that next?
